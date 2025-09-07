@@ -42,18 +42,38 @@ ASK_PHONE, WAIT_CODE, WAIT_2FA = range(3)
 def make_session_filename(phone: str) -> Path:
     """Return a Path for the session file, based on the phone number."""
     sanitized = phone.replace(" ", "").replace("-", "")
+    # ensure filename is safe; Telethon will create both .session and .session-journal etc
     return Path(f"{sanitized}.session")
 
 
 async def safe_send_file(bot, chat_id: int, path: Path, caption=""):
     """Send file and optionally delete afterwards."""
-    await bot.send_document(chat_id=chat_id, document=path.open("rb"), caption=caption)
-    if DELETE_AFTER_SEND and path.exists():
+    if not path.exists():
+        await bot.send_message(chat_id=chat_id, text="❌ Session file not found.")
+        return
+    try:
+        # open in binary mode
+        with path.open("rb") as f:
+            await bot.send_document(chat_id=chat_id, document=f, caption=caption)
+    except Exception as e:
+        logger.exception("Failed to send session file: %s", e)
+        await bot.send_message(chat_id=chat_id, text="❌ Failed to send session file.")
+        return
+
+    if DELETE_AFTER_SEND:
+        # remove session file and any related -journal if present
         try:
-            path.unlink()
-            logger.info("Deleted local session file %s", path)
+            path.unlink(missing_ok=True)
         except Exception as e:
             logger.warning("Could not delete file %s: %s", path, e)
+        # telethon may create additional files like .session-journal; attempt to remove common suffixes
+        journal = path.with_name(path.name + "-journal")
+        try:
+            if journal.exists():
+                journal.unlink()
+        except Exception:
+            pass
+        logger.info("Deleted local session file %s", path)
 
 
 # ---------------- HANDLERS ----------------
@@ -66,6 +86,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❎ Cancelled.")
+    # cleanup any partially created client
+    client = context.user_data.get("client")
+    try:
+        if client:
+            await client.disconnect()
+    except Exception:
+        pass
+    context.user_data.clear()
     return ConversationHandler.END
 
 
@@ -75,13 +103,14 @@ async def gensession_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    if not phone.startswith("+") or len(phone) < 7:
+    phone = (update.message.text or "").strip()
+    if not phone or not phone.startswith("+") or len(phone) < 7:
         await update.message.reply_text("⚠️ Invalid phone. Send again starting with +countrycode.")
         return ASK_PHONE
 
     session_path = make_session_filename(phone)
-    client = TelegramClient(session_path, int(API_ID), API_HASH)
+    # Telethon expects a string path or a Session instance
+    client = TelegramClient(str(session_path), int(API_ID), API_HASH)
 
     context.user_data["phone"] = phone
     context.user_data["client"] = client
@@ -95,27 +124,48 @@ async def receive_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAIT_CODE
     except telethon_errors.PhoneNumberInvalidError:
         await update.message.reply_text("❌ Invalid phone number. Try again with /gensession.")
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        context.user_data.clear()
         return ConversationHandler.END
     except Exception as e:
         logger.exception("Error requesting code: %s", e)
         await update.message.reply_text("❌ Error sending code. Try again later.")
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        context.user_data.clear()
         return ConversationHandler.END
 
 
 async def receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    code = update.message.text.strip()
-    client: TelegramClient = context.user_data["client"]
-    phone = context.user_data["phone"]
-    session_path: Path = context.user_data["session_path"]
+    code = (update.message.text or "").strip()
+    client: TelegramClient = context.user_data.get("client")
+    phone = context.user_data.get("phone")
+    session_path: Path = context.user_data.get("session_path")
+
+    if client is None or phone is None or session_path is None:
+        await update.message.reply_text("⚠️ Session expired or internal error. Start again with /gensession.")
+        context.user_data.clear()
+        return ConversationHandler.END
 
     try:
         await client.sign_in(phone=phone, code=code)
         await update.message.reply_text("✅ Signed in successfully! Preparing session file...")
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+        # Telethon created the session file on disk at session_path (string passed earlier)
+        # send the .session file (and related files)
         await safe_send_file(context.bot, update.effective_chat.id, session_path, caption="Here is your session file.")
+        context.user_data.clear()
         return ConversationHandler.END
+
     except telethon_errors.SessionPasswordNeededError:
         await update.message.reply_text("🔒 This account has 2FA enabled. Please send your password now.")
         return WAIT_2FA
@@ -126,32 +176,50 @@ async def receive_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception("Error signing in: %s", e)
         await update.message.reply_text("❌ Unexpected error during sign-in.")
-    await client.disconnect()
+    # ensure disconnect and cleanup
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    context.user_data.clear()
     return ConversationHandler.END
 
 
 async def receive_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    password = update.message.text.strip()
-    client: TelegramClient = context.user_data["client"]
-    session_path: Path = context.user_data["session_path"]
+    password = (update.message.text or "").strip()
+    client: TelegramClient = context.user_data.get("client")
+    session_path: Path = context.user_data.get("session_path")
+
+    if client is None or session_path is None:
+        await update.message.reply_text("⚠️ Session expired or internal error. Start again with /gensession.")
+        context.user_data.clear()
+        return ConversationHandler.END
 
     try:
         await client.sign_in(password=password)
         await update.message.reply_text("✅ 2FA accepted! Preparing session file...")
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
         await safe_send_file(context.bot, update.effective_chat.id, session_path, caption="Here is your session file.")
+    except telethon_errors.SessionPasswordNeededError:
+        await update.message.reply_text("❌ Password incorrect. Try again or /cancel.")
     except Exception as e:
         logger.exception("2FA error: %s", e)
         await update.message.reply_text("❌ Error with 2FA sign-in. Try again.")
+    finally:
         try:
             await client.disconnect()
-        except:
+        except Exception:
             pass
+        context.user_data.clear()
     return ConversationHandler.END
 
 
 # ---------------- WEBHOOK SERVER ----------------
 def setup_application():
+    # Build application normally. JobQueue extras aren't required; avoid conversation_timeout to skip JobQueue warning.
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
@@ -162,7 +230,7 @@ def setup_application():
             WAIT_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_2fa)],
         },
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
-        conversation_timeout=300,
+        # removed conversation_timeout to avoid JobQueue warning when PTB doesn't have job-queue extras
     )
 
     app.add_handler(CommandHandler("start", start_cmd))
